@@ -1,0 +1,99 @@
+# 清理环境
+rm(list = ls())
+
+# ------------------------
+# 加载所需包
+# ------------------------
+packages <- c("openxlsx", "tidyverse", "lefser", "SummarizedExperiment")
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE))
+    install.packages(pkg)
+  library(pkg, character.only = TRUE)
+}
+
+# ------------------------
+# 设置路径
+# ------------------------
+abundance_dir <- "Abundance"
+group_file <- "Group/Group.xlsx"
+clinical_file <- "Clinical/Clinical.xlsx"
+output_base <- "OutPut"
+
+# ------------------------
+# 自动读取并标准化列名为 SampleID
+# ------------------------
+group_info <- read.xlsx(group_file)
+clinical_info <- read.xlsx(clinical_file)
+
+# 将第一列统一命名为 SampleID
+colnames(group_info)[1] <- "SampleID"
+colnames(clinical_info)[1] <- "SampleID"
+colnames(group_info)[2] <- "Group"
+
+# 合并分组与临床信息
+meta_full <- left_join(group_info, clinical_info, by = "SampleID")
+if (any(is.na(meta_full))) {
+  warning("合并后的 meta 信息存在 NA，请检查 Group.xlsx 和 Clinical.xlsx 样本是否一致。")
+}
+
+# 设置行为样本名，移除 SampleID 列
+rownames(meta_full) <- meta_full$SampleID
+meta_full <- meta_full[, -which(colnames(meta_full) == "SampleID"), drop = FALSE]
+meta_full$Group <- as.factor(meta_full$Group)
+
+# ------------------------
+# 遍历所有 KEGG 丰度表
+# ------------------------
+abundance_files <- list.files(abundance_dir, pattern = "\\.xlsx$", full.names = TRUE)
+
+for (file in abundance_files) {
+  cat("🔍 正在分析：", file, "\n")
+  level_name <- tools::file_path_sans_ext(basename(file))
+  level_name <- gsub("KEGG\\.", "", level_name)
+  output_dir <- file.path(output_base, level_name)
+  if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+  # ✅ 不跳过任何行，完整读取
+  abundance_df <- read.xlsx(file)
+  rownames(abundance_df) <- abundance_df[[1]]
+  abundance_df <- abundance_df[, -1, drop = FALSE]
+
+  # 仅保留数值型列
+  abundance_df <- abundance_df[, sapply(abundance_df, is.numeric), drop = FALSE]
+  abundance_mat <- as.matrix(abundance_df)
+
+  # 匹配样本
+  matched_samples <- intersect(colnames(abundance_mat), rownames(meta_full))
+  if (length(matched_samples) < 2) {
+    warning("匹配样本数过少，跳过：", file)
+    next
+  }
+  abundance_mat <- abundance_mat[, matched_samples, drop = FALSE]
+  meta_sub <- meta_full[matched_samples, , drop = FALSE]
+
+  # 构建 SummarizedExperiment 对象
+  se <- SummarizedExperiment(
+    assays = SimpleList(exprs = abundance_mat),
+    colData = meta_sub
+  )
+
+  # ✅ 排除共线性变量：保留末端分类节点
+  terminal_nodes <- get_terminal_nodes(rownames(se))
+  se <- se[terminal_nodes, ]
+
+  # 相对丰度转换
+  se <- relativeAb(se)
+
+  # 运行 LEfSe 分析
+  set.seed(1234)
+  res <- lefser(se, classCol = "Group")
+
+  # 保存结果表
+  write.xlsx(as.data.frame(res), file = file.path(output_dir, "lefse_results.xlsx"), rowNames = TRUE)
+
+  # 保存图像
+  p <- lefserPlot(res)
+  ggsave(file.path(output_dir, "lefse_plot.pdf"), plot = p, width = 8, height = 6)
+
+  cat("✅ 完成：", level_name, "\n\n")
+}
