@@ -2,30 +2,56 @@
 rm(list = ls())
 
 # ------------------------
+```{r}
 # 加载所需包
 # ------------------------
-packages <- c("openxlsx", "tidyverse", "lefser", "SummarizedExperiment")
-for (pkg in packages) {
-  if (!requireNamespace(pkg, quietly = TRUE))
+base_packages <- c("openxlsx", "tidyverse", "lefser", "SummarizedExperiment")
+
+for (pkg in base_packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
     install.packages(pkg)
-  library(pkg, character.only = TRUE)
+  }
+  suppressPackageStartupMessages(library(pkg, character.only = TRUE))
 }
 
-# ------------------------
-# 设置路径
+# ggplot2 和 dplyr 已包含在 tidyverse，不重复加载
+
+```
+
+
+
+```{r}
 # ------------------------
 abundance_dir <- "Abundance"
-group_file <- "Group/Group.xlsx"
-clinical_file <- "Clinical/Clinical.xlsx"
+group_dir <- "Group"
+clinical_dir <- "Clinical"
 output_base <- "OutPut"
 
 # ------------------------
-# 自动读取并标准化列名为 SampleID
+# 自动识别 Group 和 Clinical 文件
+# ------------------------
+group_file <- list.files(group_dir, pattern = "\\.xlsx$", full.names = TRUE)[1]
+clinical_file <- list.files(clinical_dir, pattern = "\\.xlsx$", full.names = TRUE)[1]
+
+if (is.na(group_file) || is.na(clinical_file)) {
+  stop("❌ Group 或 Clinical 文件夹中未找到 Excel 文件，请确认路径和文件存在。")
+}
+
+cat("📄 检测到分组文件：", basename(group_file), "\n")
+cat("📄 检测到临床文件：", basename(clinical_file), "\n")
+```
+
+
+# ------------------------
+# 设置路径
+
+```{r}
+# ------------------------
+# 读取分组与临床信息
 # ------------------------
 group_info <- read.xlsx(group_file)
 clinical_info <- read.xlsx(clinical_file)
 
-# 将第一列统一命名为 SampleID
 colnames(group_info)[1] <- "SampleID"
 colnames(clinical_info)[1] <- "SampleID"
 colnames(group_info)[2] <- "Group"
@@ -36,12 +62,17 @@ if (any(is.na(meta_full))) {
   warning("合并后的 meta 信息存在 NA，请检查 Group.xlsx 和 Clinical.xlsx 样本是否一致。")
 }
 
-# 设置行为样本名，移除 SampleID 列
 rownames(meta_full) <- meta_full$SampleID
 meta_full <- meta_full[, -which(colnames(meta_full) == "SampleID"), drop = FALSE]
 meta_full$Group <- as.factor(meta_full$Group)
 
 # ------------------------
+```
+
+
+
+
+```{r}
 # 遍历所有 KEGG 丰度表
 # ------------------------
 abundance_files <- list.files(abundance_dir, pattern = "\\.xlsx$", full.names = TRUE)
@@ -53,12 +84,10 @@ for (file in abundance_files) {
   output_dir <- file.path(output_base, level_name)
   if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
 
-  # ✅ 不跳过任何行，完整读取
+  # 读取丰度表
   abundance_df <- read.xlsx(file)
   rownames(abundance_df) <- abundance_df[[1]]
   abundance_df <- abundance_df[, -1, drop = FALSE]
-
-  # 仅保留数值型列
   abundance_df <- abundance_df[, sapply(abundance_df, is.numeric), drop = FALSE]
   abundance_mat <- as.matrix(abundance_df)
 
@@ -77,23 +106,61 @@ for (file in abundance_files) {
     colData = meta_sub
   )
 
-  # ✅ 排除共线性变量：保留末端分类节点
+  # 获取末端节点（注意此函数需定义或依赖包提供）
   terminal_nodes <- get_terminal_nodes(rownames(se))
   se <- se[terminal_nodes, ]
 
-  # 相对丰度转换
+  # 相对丰度
   se <- relativeAb(se)
 
-  # 运行 LEfSe 分析
+  # LEfSe 分析
   set.seed(1234)
   res <- lefser(se, classCol = "Group")
 
   # 保存结果表
   write.xlsx(as.data.frame(res), file = file.path(output_dir, "lefse_results.xlsx"), rowNames = TRUE)
 
+  # 自定义 ggplot 作图
+  lda_df <- as.data.frame(res)
+  colnames(lda_df) <- c("features", "scores")
+
+  lda_df$class <- ifelse(lda_df$scores > 0, "Group_AN", "Group_HC")
+  lda_df <- lda_df %>%
+    arrange(scores) %>%
+    mutate(order = row_number(),
+           class = factor(class, levels = c("Group_HC", "Group_AN")))
+
+  # 柱子数量决定图像高度
+  n_bars <- nrow(lda_df)
+  plot_height <- min(n_bars * 0.2, 20)
+
+  p <- ggplot(lda_df, aes(x = factor(order), y = scores, fill = class)) +
+    geom_bar(stat = "identity", width = 0.6, color = "black", size = 0.3) +
+    geom_text(aes(y = 0, label = features,
+                  hjust = ifelse(scores < 0, 0, 1)),
+              nudge_y = ifelse(lda_df$scores < 0, 0.1, -0.1),
+              size = 3.5, color = "black") +
+    geom_hline(yintercept = 0, color = "black") +
+    scale_y_continuous(name = "LDA SCORE (log10)", breaks = pretty(lda_df$scores, n = 5)) +
+    scale_fill_manual(values = c("Group_HC" = "lightgreen", "Group_AN" = "orchid")) +
+    scale_x_discrete(expand = expansion(mult = c(0, 0))) +
+    coord_flip() +
+    theme_void(base_size = 13) +
+    theme(
+      axis.title.x = element_text(size = 11),
+      axis.text.x = element_text(size = 10),
+      axis.text.y = element_blank(),
+      legend.position = "top",
+      legend.title = element_blank(),
+      panel.grid.major.x = element_line(color = "grey", linewidth = 0.5, linetype = "dotted"),
+      panel.grid.minor.x = element_line(color = "grey", linewidth = 0.5, linetype = "dotted")
+    )
+
   # 保存图像
-  p <- lefserPlot(res)
-  ggsave(file.path(output_dir, "lefse_plot.pdf"), plot = p, width = 8, height = 6)
+  ggsave(file.path(output_dir, "lefse_plot.pdf"), plot = p, width = 8, height = plot_height)
 
   cat("✅ 完成：", level_name, "\n\n")
 }
+```
+
+
